@@ -7,6 +7,7 @@
   ],
   "license": "ISC",
   "type": "module",
+  "packageManager": "pnpm@11.22.0",
   "pi": {
     "extensions": [
       "./src/index.ts"
@@ -20,13 +21,6 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test"
-  },
-  "devEngines": {
-    "packageManager": {
-      "name": "pnpm",
-      "version": "^11.22.0",
-      "onFail": "download"
-    }
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.12",
