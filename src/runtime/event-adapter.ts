@@ -27,6 +27,7 @@ import {
 
 interface ParsedRequest {
   requestId?: string;
+  fingerprint?: string;
   request?: {
     requestId: string;
     title?: string;
@@ -40,11 +41,19 @@ interface ParsedRequest {
 
 interface PendingRequest {
   requestId: string;
+  fingerprint: string;
   questions: NormalizedQuestion[];
   title?: string;
   handle?: QuestionnaireJobHandle;
   settled: boolean;
 }
+
+interface CompletedRequest {
+  fingerprint?: string;
+  response: AskUserQuestionResponse;
+}
+
+const COMPLETED_REQUEST_CACHE_LIMIT = 64;
 
 function internalFailure(
   questions: NormalizedQuestion[],
@@ -72,10 +81,35 @@ function validRequestId(value: unknown): value is string {
   );
 }
 
+function requestFingerprint(
+  request: Omit<NonNullable<ParsedRequest["request"]>, "requestId">,
+): string {
+  return JSON.stringify({
+    version: 1,
+    title: request.title ?? "",
+    questions: request.questions,
+  });
+}
+
+function rawRequestFingerprint(
+  record: Record<string, unknown>,
+): string | undefined {
+  try {
+    return JSON.stringify({
+      version: record.version,
+      title: record.title,
+      questions: record.questions,
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 function parseRequest(data: unknown): ParsedRequest {
   const record = asRecord(data);
   const requestId = record?.requestId;
   const parsedRequestId = validRequestId(requestId) ? requestId : undefined;
+  const fingerprint = record ? rawRequestFingerprint(record) : undefined;
 
   if (!record) {
     return {
@@ -85,12 +119,14 @@ function parseRequest(data: unknown): ParsedRequest {
   if (!("version" in record)) {
     return {
       requestId: parsedRequestId,
+      fingerprint,
       error: { code: "invalid-request", message: "version is required" },
     };
   }
   if (record.version !== 1) {
     return {
       requestId: parsedRequestId,
+      fingerprint,
       error: {
         code: "unsupported-version",
         message: "Unsupported ask_user_question request version",
@@ -109,6 +145,7 @@ function parseRequest(data: unknown): ParsedRequest {
   if (record.title !== undefined && typeof record.title !== "string") {
     return {
       requestId: parsedRequestId,
+      fingerprint,
       error: { code: "invalid-request", message: "title must be a string" },
     };
   }
@@ -119,6 +156,7 @@ function parseRequest(data: unknown): ParsedRequest {
   if (!validation.ok) {
     return {
       requestId: parsedRequestId,
+      fingerprint,
       error: { code: "invalid-request", message: validation.error.message },
     };
   }
@@ -129,7 +167,11 @@ function parseRequest(data: unknown): ParsedRequest {
   };
   const title = typeof record.title === "string" ? record.title.trim() : "";
   if (title) request.title = title;
-  return { requestId: parsedRequestId, request };
+  return {
+    requestId: parsedRequestId,
+    fingerprint: requestFingerprint(request),
+    request,
+  };
 }
 
 function resultFromExecution(
@@ -185,7 +227,21 @@ export function registerAskUserQuestionEvents(
   let shuttingDown = false;
   const waiting: PendingRequest[] = [];
   const pending = new Map<string, PendingRequest>();
-  const seenRequestIds = new Set<string>();
+  const completed = new Map<string, CompletedRequest>();
+
+  function rememberCompleted(
+    requestId: string,
+    fingerprint: string | undefined,
+    response: AskUserQuestionResponse,
+  ) {
+    completed.delete(requestId);
+    completed.set(requestId, { fingerprint, response });
+    while (completed.size > COMPLETED_REQUEST_CACHE_LIMIT) {
+      const oldestRequestId = completed.keys().next().value;
+      if (oldestRequestId === undefined) break;
+      completed.delete(oldestRequestId);
+    }
+  }
 
   let unsubscribeRequest: (() => void) | undefined = pi.events.on(
     ASK_USER_QUESTION_REQUEST_EVENT,
@@ -193,27 +249,33 @@ export function registerAskUserQuestionEvents(
       const parsed = parseRequest(data);
       if (!parsed.requestId) return;
 
-      if (seenRequestIds.has(parsed.requestId)) {
-        pi.events.emit(
-          getAskUserQuestionReplyEvent(parsed.requestId),
-          errorResponse(
-            parsed.requestId,
-            "duplicate-request-id",
-            `requestId has already been used: ${parsed.requestId}`,
-          ),
-        );
+      const pendingRequest = pending.get(parsed.requestId);
+      if (pendingRequest) {
+        if (parsed.fingerprint === pendingRequest.fingerprint) return;
         return;
       }
-      seenRequestIds.add(parsed.requestId);
+
+      const completedRequest = completed.get(parsed.requestId);
+      if (completedRequest) {
+        if (parsed.fingerprint === completedRequest.fingerprint) {
+          pi.events.emit(
+            getAskUserQuestionReplyEvent(parsed.requestId),
+            completedRequest.response,
+          );
+        }
+        return;
+      }
 
       if (parsed.error) {
+        const response = errorResponse(
+          parsed.requestId,
+          parsed.error.code,
+          parsed.error.message,
+        );
+        rememberCompleted(parsed.requestId, parsed.fingerprint, response);
         pi.events.emit(
           getAskUserQuestionReplyEvent(parsed.requestId),
-          errorResponse(
-            parsed.requestId,
-            parsed.error.code,
-            parsed.error.message,
-          ),
+          response,
         );
         return;
       }
@@ -221,6 +283,7 @@ export function registerAskUserQuestionEvents(
 
       const request: PendingRequest = {
         requestId: parsed.request.requestId,
+        fingerprint: parsed.fingerprint ?? requestFingerprint(parsed.request),
         questions: parsed.request.questions,
         title: parsed.request.title,
         settled: false,
@@ -285,10 +348,9 @@ export function registerAskUserQuestionEvents(
     if (request.settled) return;
     request.settled = true;
     pending.delete(request.requestId);
-    pi.events.emit(
-      getAskUserQuestionReplyEvent(request.requestId),
-      responseFromExecution(request.requestId, execution),
-    );
+    const response = responseFromExecution(request.requestId, execution);
+    rememberCompleted(request.requestId, request.fingerprint, response);
+    pi.events.emit(getAskUserQuestionReplyEvent(request.requestId), response);
   }
 
   function drainWaiting() {
@@ -319,7 +381,7 @@ export function registerAskUserQuestionEvents(
       complete(request, shutdownExecution(request.questions));
     }
     pending.clear();
-    seenRequestIds.clear();
+    completed.clear();
     unsubscribeRequest?.();
     unsubscribeCancel?.();
     unsubscribeRequest = undefined;
@@ -338,7 +400,7 @@ export function registerAskUserQuestionEvents(
         complete(request, shutdownExecution(request.questions));
       }
       pending.clear();
-      seenRequestIds.clear();
+      completed.clear();
       unsubscribeRequest?.();
       unsubscribeCancel?.();
       unsubscribeRequest = undefined;

@@ -123,13 +123,13 @@ pi.events.emit(CANCEL_EVENT, {
 
 interactive UIを競合させないため、Tool requestとprogrammatic requestを共有FIFOで serialize します。active requestが終わるまで後続requestはqueueされ、request自体は失われません。caller cancelまたはsession shutdownでqueue中のrequestもterminal responseになります。
 
-同じ `requestId` はsession内で一度だけ受け付けます。処理中・完了後を問わず再利用すると `duplicate-request-id` を返し、別のUIは開きません。
+`requestId` はsession内のidempotency keyとして扱われます。同じrequestの再送ではquestionnaireを再実行せず、activeまたはqueuedならoriginal requestの結果を共有し、completedならterminal responseを再送します。terminal responseのcacheはsession内でboundedに保持されます。同じ `requestId` でpayload（`version`、`title`、`questions`）が異なるrequestはconflictとして無視され、original requestを妨げません。
 
 ## Cancellation
 
 - HumanがEscで閉じる: `success: true`, `result.status: "user-cancelled"`, `cancelled: true`
-- callerがcancel eventを発行する: `success: true`, `result.status: "caller-aborted"`, `cancelled: true`
+- callerがcancel eventを発行する: `success: true`, `result.status: "caller-aborted"`, `cancelled: true`。`cancel:<requestId>` は同じlogical requestを共有する全callerに対してそのlogical request全体をcancelします。
 - session shutdown/reload: pending requestへ `success: true`, `result.status: "shutdown"`, `cancelled: true`
 - TUI unavailable、invalid request、unsupported version、内部失敗: `success: false` の structured error
 
-Extension reload時は Pi の event-bus cleanup に加えて、この Extensionも pending request と listener を明示的にcleanupします。
+Extension reload時は Pi の event-bus cleanup に加えて、この Extensionも pending request、completed response cache、request identity state、listenerを明示的にcleanupします。
