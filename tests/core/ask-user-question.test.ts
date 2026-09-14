@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildDetails,
   normalizeQuestions,
+  prepareAskUserQuestionArgs,
+  validateAndNormalizeQuestions,
 } from "../../src/core/ask-user-question";
 
 describe("ask-user-question core", () => {
@@ -31,6 +33,52 @@ describe("ask-user-question core", () => {
 
     expect(details.answers).toEqual({ "Which output format?": "JSON" });
     expect(details.selections[0]?.selectedIndices).toEqual([2]);
+  });
+
+  it("keeps the existing legacy argument preparation path", () => {
+    const prepared = prepareAskUserQuestionArgs({
+      questions: [
+        {
+          prompt: "Which output format?",
+          label: "Format",
+          choices: ["Summary", "JSON"],
+        },
+      ],
+    });
+
+    expect(validateAndNormalizeQuestions(prepared)).toMatchObject({
+      ok: true,
+      questions: [{ question: "Which output format?", header: "Format" }],
+    });
+  });
+
+  it("rejects blank questions, duplicate identifiers, and unsupported types", () => {
+    expect(
+      validateAndNormalizeQuestions({
+        questions: [{ question: " ", options: [] }],
+      }),
+    ).toMatchObject({ ok: false, error: { code: "invalid-request" } });
+
+    expect(
+      validateAndNormalizeQuestions({
+        questions: [
+          { question: "Same", options: [] },
+          { question: "Same", options: [] },
+        ],
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining("Duplicate") },
+    });
+
+    expect(
+      validateAndNormalizeQuestions({
+        questions: [{ question: "Unsupported", type: "text", options: [] }],
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { message: expect.stringContaining("unsupported") },
+    });
   });
 
   it("normalizes the multi-question and preserves multiple selections", () => {
