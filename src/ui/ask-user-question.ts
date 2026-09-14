@@ -39,6 +39,7 @@ export function createQuestionnaireComponent(
   questions: NormalizedQuestion[],
   signal: AbortSignal | undefined,
   done: (result: AskUserQuestionDetails) => void,
+  title?: string,
 ): Component & { dispose(): void } {
   const hasMultiSelect = questions.some((question) => question.multiSelect);
   const showTabs = questions.length > 1 || hasMultiSelect;
@@ -287,6 +288,11 @@ export function createQuestionnaireComponent(
     }
 
     lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+
+    if (title) {
+      addWrappedWithPrefix(" ", theme.fg("accent", theme.bold(title)));
+      lines.push("");
+    }
 
     if (showTabs) {
       const tabs: string[] = ["← "];
