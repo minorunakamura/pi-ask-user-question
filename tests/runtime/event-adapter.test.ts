@@ -144,6 +144,15 @@ function nextReply(
   });
 }
 
+function subscribeReplies(pi: FakePi, requestId: string) {
+  const replies: AskUserQuestionResponse[] = [];
+  const unsubscribe = pi.events.on(
+    getAskUserQuestionReplyEvent(requestId),
+    (data) => replies.push(data as AskUserQuestionResponse),
+  );
+  return { replies, unsubscribe };
+}
+
 async function start(pi: FakePi, context: ReturnType<typeof createContext>) {
   await pi.trigger("session_start", context.ctx);
 }
@@ -227,13 +236,20 @@ describe("ask_user_question extension event API", () => {
     await Promise.resolve();
 
     const reply = nextReply(pi, "after-tool");
-    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, {
-      version: 1,
+    const queuedRequest = {
+      version: 1 as const,
       requestId: "after-tool",
       questions: validQuestions(),
-    });
+    };
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, queuedRequest);
     await Promise.resolve();
+
+    const queuedDuplicate = subscribeReplies(pi, queuedRequest.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, { ...queuedRequest });
+    await Promise.resolve();
+
     expect(context.custom).toHaveBeenCalledTimes(1);
+    expect(queuedDuplicate.replies).toEqual([]);
 
     context.doneCallbacks[0]?.(
       answerFor(normalizeQuestions({ questions: validQuestions() })),
@@ -244,11 +260,14 @@ describe("ask_user_question extension event API", () => {
     context.doneCallbacks[1]?.(
       answerFor(normalizeQuestions({ questions: validQuestions() })),
     );
-    await expect(reply).resolves.toMatchObject({
+    const response = await reply;
+    expect(response).toMatchObject({
       requestId: "after-tool",
       success: true,
       result: { status: "answered" },
     });
+    await nextTick();
+    expect(queuedDuplicate.replies).toEqual([response]);
   });
 
   it("does not lose a request emitted before session_start", async () => {
@@ -398,51 +417,140 @@ describe("ask_user_question extension event API", () => {
     });
   });
 
-  it("rejects duplicate ids and serializes concurrent questionnaires", async () => {
+  it("shares one active questionnaire with idempotent duplicate callers", async () => {
     const pi = createFakePi();
     extension(pi as unknown as ExtensionAPI);
     const context = createContext();
     await start(pi, context);
 
-    const first = nextReply(pi, "same-id");
-    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, {
-      version: 1,
+    const request = {
+      version: 1 as const,
       requestId: "same-id",
       questions: validQuestions(),
-    });
+    };
+    const callerA = subscribeReplies(pi, request.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, request);
     await Promise.resolve();
 
-    const duplicate = nextReply(pi, "same-id");
-    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, {
-      version: 1,
-      requestId: "same-id",
-      questions: validQuestions(),
-    });
-    await expect(duplicate).resolves.toMatchObject({
-      success: false,
-      error: { code: "duplicate-request-id" },
-    });
-
-    const second = nextReply(pi, "second-id");
-    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, {
-      version: 1,
-      requestId: "second-id",
-      questions: validQuestions(),
-    });
+    const callerB = subscribeReplies(pi, request.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, { ...request });
     await Promise.resolve();
+
     expect(context.custom).toHaveBeenCalledTimes(1);
+    expect(callerA.replies).toEqual([]);
+    expect(callerB.replies).toEqual([]);
 
     context.doneCallbacks[0]?.(
       answerFor(normalizeQuestions({ questions: validQuestions() })),
     );
-    await first;
     await nextTick();
-    expect(context.custom).toHaveBeenCalledTimes(2);
-    context.doneCallbacks[1]?.(
+
+    expect(callerA.replies).toHaveLength(1);
+    expect(callerB.replies).toEqual(callerA.replies);
+    expect(callerA.replies[0]).toMatchObject({
+      requestId: request.requestId,
+      success: true,
+      result: { status: "answered" },
+    });
+  });
+
+  it("replays a completed terminal response without opening another UI", async () => {
+    const pi = createFakePi();
+    extension(pi as unknown as ExtensionAPI);
+    const context = createContext();
+    await start(pi, context);
+
+    const request = {
+      version: 1 as const,
+      requestId: "completed-id",
+      questions: validQuestions(),
+    };
+    const original = nextReply(pi, request.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, request);
+    await Promise.resolve();
+    context.doneCallbacks[0]?.(
       answerFor(normalizeQuestions({ questions: validQuestions() })),
     );
-    await expect(second).resolves.toMatchObject({
-      requestId: "second-id",
+    const originalResponse = await original;
+
+    const retry = nextReply(pi, request.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, { ...request });
+
+    await expect(retry).resolves.toEqual(originalResponse);
+    expect(context.custom).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels one logical request for duplicate subscribers", async () => {
+    const pi = createFakePi();
+    extension(pi as unknown as ExtensionAPI);
+    const context = createContext();
+    await start(pi, context);
+
+    const request = {
+      version: 1 as const,
+      requestId: "cancel-duplicate",
+      questions: validQuestions(),
+    };
+    const callerA = subscribeReplies(pi, request.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, request);
+    await Promise.resolve();
+    const callerB = subscribeReplies(pi, request.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, { ...request });
+    await Promise.resolve();
+
+    pi.events.emit(ASK_USER_QUESTION_CANCEL_EVENT, {
+      version: 1,
+      requestId: request.requestId,
+    });
+    await nextTick();
+
+    expect(context.custom).toHaveBeenCalledTimes(1);
+    expect(callerA.replies).toHaveLength(1);
+    expect(callerB.replies).toEqual(callerA.replies);
+    expect(callerA.replies[0]).toMatchObject({
+      success: true,
+      result: { status: "caller-aborted", cancelled: true },
+    });
+  });
+
+  it("ignores a conflicting payload without breaking the original request", async () => {
+    const pi = createFakePi();
+    extension(pi as unknown as ExtensionAPI);
+    const context = createContext();
+    await start(pi, context);
+
+    const original = {
+      version: 1 as const,
+      requestId: "conflict-id",
+      questions: validQuestions(),
+    };
+    const conflicting = {
+      ...original,
+      questions: [
+        {
+          question: "Different question?",
+          header: "Different",
+          options: [{ label: "A" }, { label: "B" }],
+        },
+      ],
+    };
+    const replies = subscribeReplies(pi, original.requestId);
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, original);
+    await Promise.resolve();
+    pi.events.emit(ASK_USER_QUESTION_REQUEST_EVENT, conflicting);
+    await Promise.resolve();
+
+    expect(context.custom).toHaveBeenCalledTimes(1);
+    expect(replies.replies).toEqual([]);
+
+    context.doneCallbacks[0]?.(
+      answerFor(normalizeQuestions({ questions: validQuestions() })),
+    );
+    await nextTick();
+
+    expect(replies.replies).toHaveLength(1);
+    expect(replies.replies[0]).toMatchObject({
+      requestId: original.requestId,
       success: true,
       result: { status: "answered" },
     });
